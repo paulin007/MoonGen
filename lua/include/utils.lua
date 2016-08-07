@@ -4,7 +4,7 @@
 --- @todo TODO docu
 --- @todo local unpackers ... crashes lua2dox parser
 ---------------------------------
-require "colors"
+local colors = require "colors"
 
 local bor, band, bnot, rshift, lshift, bswap = bit.bor, bit.band, bit.bnot, bit.rshift, bit.lshift, bit.bswap
 local write = io.write
@@ -216,6 +216,17 @@ function checksum(data, len)
 			cs = band(cs, 0xFFFF) + 1
 		end
 	end
+	-- missing the very last uint_8 for odd sized packets
+	-- note that this access is always valid in MoonGen
+	--  * buffers are a fixed even size >= pkt len
+	--  * pkt length is just metadata and not the actual length of the buffer
+	if (len % 2) == 1 then
+		-- simply null the byte outside of our packet
+		cs = cs + band(data[len / 2], 0xFF)
+		if cs >= 2^16 then
+			cs = band(cs, 0xFFFF) + 1
+		end
+	end
 	return band(bnot(cs), 0xFFFF)
 end
 
@@ -338,15 +349,31 @@ end
 --- @param data The cdata to be dumped.
 --- @param bytes Number of bytes to dump.
 --- @param stream the stream to write to, defaults to io.stdout
-function dumpHex(data, bytes, stream)
+--- @param seps A table with the protocol offsets. Used to colorize the output
+function dumpHex(data, bytes, stream, seps)
 	local data = ffi.cast("uint8_t*", data)
 	stream = stream or io.stdout
+
+	local cSep = 1
+	local cColor = seps and getColorCode(cSep) or ''
 	for i = 0, bytes - 1 do
-		if i % 16 == 0 then -- new line
-			stream:write(format("  0x%04x:   ", i))
+		-- determine color
+		-- its prepended to the current byte for each new line or if the color changes
+		-- otherwise '' gets prepended
+		if seps and cSep <= #seps and seps[cSep] == i then
+			cSep = cSep + 1
+			cColor = getColorCode(cSep)
 		end
 
-		stream:write(format("%02x", data[i]))
+		-- new line
+		if i % 16 == 0 then
+			cColor = seps and getColorCode("white") or ''
+			stream:write(cColor .. string.format("  0x%04x:   ", i))
+			cColor = seps and getColorCode(cSep) or ''
+		end
+
+		stream:write(cColor .. string.format("%02x", data[i]))
+		cColor = ''
 		
 		if i % 2  == 1 then -- group 2 bytes
 			stream:write(" ")
@@ -355,7 +382,7 @@ function dumpHex(data, bytes, stream)
 			stream:write("\n")
 		end
 	end
-	stream:write("\n\n")
+	stream:write((seps and getColorCode() or '') .. "\n\n")
 end
 
 --- Merge tables.
@@ -439,4 +466,32 @@ function getOS()
 	return trim(os), major, minor, patch
 end
 
+-- Deep copy's a table, and returns the copy.
+-- @param orig The original table to copy.
+function deepCopy(orig)
+    local origType = type(orig)
+    local copy    
 
+    if origType == 'table' then
+        copy = {}
+        for k,v in next, orig, nil do
+            copy[deepCopy(k)] = deepCopy(v)
+        end
+        setmetatable(copy, deepCopy(getmetatable(orig)))
+    else -- simple type
+        copy = orig
+    end
+    return copy
+end
+
+-- Generates a random number in range [1, 120] for the IMIX.
+function imixSize() 
+    local rnum = math.random(120);
+    if rnum <= 10 then         -- 1 in 12 : [1 - 10]   : 10 / 120
+        return 1518
+    elseif rnum <= 50 then     -- 4 in 12 : [11 - 50]  : 40 / 120
+        return 574
+    else                       -- 7 in 12 : [51 - 120] : 70 / 120
+        return 68     
+    end
+end

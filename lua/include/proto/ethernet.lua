@@ -39,6 +39,9 @@ eth.TYPE_IP6 = 0x86dd
 --- EtherType for Ptp
 eth.TYPE_PTP = 0x88f7
 
+--- EtherType for LACP (Actually, 'Slow Protocols')
+eth.TYPE_LACP = 0x8809
+
 --- Ethernet broadcast address
 eth.BROADCAST = "ff:ff:ff:ff:ff:ff"
 
@@ -61,6 +64,7 @@ end
 --- Set the MAC address.
 --- @param addr Address as number
 function macAddr:set(addr)
+	addr = addr or 0
 	self.uint8[0] = bit.band(addr, 0xFF)
 	self.uint8[1] = bit.band(bit.rshift(addr, 8), 0xFF)
 	self.uint8[2] = bit.band(bit.rshift(addr, 16), 0xFF)
@@ -180,6 +184,8 @@ function etherHeader:getTypeString()
 		cleartext = "(ARP)"
 	elseif type == eth.TYPE_PTP then
 		cleartext = "(PTP)"
+	elseif type == eth.TYPE_LACP then
+		cleartext = "(LACP)"
 	else
 		cleartext = "(unknown)"
 	end
@@ -252,6 +258,7 @@ local mapNameType = {
 	ip6 = eth.TYPE_IP6,
 	arp = eth.TYPE_ARP,
 	ptp = eth.TYPE_PTP, 
+	lacp = eth.TYPE_LACP,
 }
 
 --- Resolve which header comes after this one (in a packet).
@@ -288,6 +295,9 @@ function etherHeader:setDefaultNamedArgs(pre, namedArgs, nextHeader, accumulated
 				break
 			end
 		end
+	end
+	if nextHeader == "lacp" then
+		namedArgs[pre .. "Dst"] = "01:80:c2:00:00:02"
 	end
 	return namedArgs
 end

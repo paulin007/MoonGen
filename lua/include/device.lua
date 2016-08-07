@@ -38,8 +38,10 @@ mod.PCI_ID_I350		= 0x80861521
 mod.PCI_ID_82576	= 0x80861526
 mod.PCI_ID_X710		= 0x80861572
 mod.PCI_ID_XL710	= 0x80861583
+mod.PCI_ID_XL710Q1	= 0x80861584
 
 mod.PCI_ID_82599_VF	= 0x808610ed
+mod.PCI_ID_VIRTIO	= 0x1af41000
 
 function mod.init()
 	dpdkc.rte_pmd_init_all_export();
@@ -100,9 +102,9 @@ local devices = {}
 ---   dropEnable optional (default = true)
 ---   rssNQueues optional (default = 0) If this is >0 RSS will be activated for
 ---    this device. Incomming packates will be distributed to the
----    rxQueues number 0 to (rssNQueues - 1). For a fair distribution use one of
----    the following values (1, 2, 4, 8, 16). Values greater than 16 are not
----    allowed.
+---    rxQueues number rssBaseQueue to (rssBaseQueue + rssNQueues - 1).
+---    Use a power of two to achieve a better distribution.
+---   rssBaseQueue optional (default = 0) The first queue to use for RSS
 ---   rssFunctions optional (default = all supported functions) A Table,
 ---    containing hashing methods, which can be used for RSS.
 ---    Possible methods are:
@@ -115,6 +117,7 @@ local devices = {}
 ---	  disableOffloads optional (default = false) Disable offloading, this
 ---     speeds up the driver. Note that timestamping is an offload as far
 ---     as the driver is concerned.
+---   stripVlan (default = true) Strip the VLAN tag on the NIC.
 --- @todo FIXME: add description for speed and dropEnable parameters.
 function mod.config(...)
 	local args = {...}
@@ -159,6 +162,9 @@ function mod.config(...)
 		mod.RSS_FUNCTION_IPV6_UDP,
 		mod.RSS_FUNCTION_IPV6_TCP
 	}
+	if args.stripVlan == nil then
+		args.stripVlan = true
+	end
 	-- create a mempool with enough memory to hold tx, as well as rx descriptors
 	-- (tx descriptors for forwarding applications when rx descriptors from one of the device are directly put into a tx queue of another device)
 	-- FIXME: n = 2^k-1 would save memory
@@ -199,71 +205,66 @@ function mod.config(...)
 		end
 		rss_enabled = 1
 	end
+	local pciId = dpdkc.get_pci_id(args.port)
 	-- FIXME: this is stupid and should be fixed in DPDK
-	local isi40e = dpdkc.get_pci_id(args.port) == mod.PCI_ID_XL710
-			or dpdkc.get_pci_id(args.port) == mod.PCI_ID_X710
+	local isi40e = pciId == mod.PCI_ID_XL710
+	            or pciId == mod.PCI_ID_X710
+	            or pciId == mod.PCI_ID_XL710Q1
 	-- TODO: support options
-	local rc = dpdkc.configure_device(args.port, args.rxQueues, args.txQueues, args.rxDescs, args.txDescs, args.speed, args.mempool, args.dropEnable, rss_enabled, rss_hash_mask, args.disableOffloads or false, isi40e)
+	local disablePadding = pciId == mod.PCI_ID_X540
+	                    or pciId == mod.PCI_ID_X520
+	                    or pciId == mod.PCI_ID_X520_T2
+	                    or pciId == mod.PCI_ID_82599
+	local rc = dpdkc.configure_device(args.port, args.rxQueues, args.txQueues, args.rxDescs, args.txDescs, args.speed, args.mempool, args.dropEnable, rss_enabled, rss_hash_mask, args.disableOffloads or false, isi40e, args.stripVlan, disablePadding)
 	if rc ~= 0 then
 	    log:fatal("Could not configure device %d: error %d", args.port, rc)
 	end
 	local dev = mod.get(args.port)
 	dev.initialized = true
 	if rss_enabled == 1 then
-		dev:setRssNQueues(args.rssNQueues)
+		dev:setRssNQueues(args.rssNQueues, args.rssBaseQueue)
 	end
 	dev:setPromisc(true)
 	return dev
 end
 
 ffi.cdef[[
-/**
- * A structure used to configure Redirection Table of  the Receive Side
- * Scaling (RSS) feature of an Ethernet port.
- */
-struct rte_eth_rss_reta {
-	/** First 64 mask bits indicate which entry(s) need to updated/queried. */
-	uint64_t mask_lo;
-	/** Second 64 mask bits indicate which entry(s) need to updated/queried. */
-	uint64_t mask_hi;
-	uint8_t reta[128];  /**< 128 RETA entries*/
+struct rte_eth_rss_reta_entry64 {
+	uint64_t mask;
+	uint16_t reta[64];
 };
 
-int mg_rte_eth_dev_rss_reta_update 	( 	uint8_t  	port,
-		struct rte_eth_rss_reta *  	reta_conf 
-	);
-int rte_eth_dev_rss_reta_update 	( 	uint8_t  	port,
-		struct rte_eth_rss_reta *  	reta_conf 
-	);
+int rte_eth_dev_rss_reta_update(uint8_t port, struct rte_eth_rss_reta_entry64* reta_conf, uint16_t reta_size);
+uint16_t get_reta_size(int port);
 ]]
 
-function dev:setRssNQueues(n)
-  if(n>16)then
-    log:fatal("Maximum possible numbers of RSS queues is 16")
-    return
-  end
-  if(({[1]=1, [2]=1, [4]=1, [8]=1, [16]=1})[n] == nil) then
-    log:warn("RSS distribution to queues will not be fair. Fair distribution is only achieved with a number of Queues equal to 1, 2, 4, 8 or 16. However you are currently using %d queues", n)
-  end
-  local reta = ffi.new("struct rte_eth_rss_reta")
-
-  local npq = 128/n
-  local queue = 0
-  for i=0,127 do
-    reta.reta[i] = queue
-    if (queue < n - 1) then
-      queue = queue+1
-    else
-      queue = 0
-    end
-  end
-
-  -- the mg_ version of rte_eth_dev_rss_reta_update() will also write the mask
-  -- to the reta_config struct, as lua can not do 64bit unsigned int operations.
-  local ret = ffi.C.mg_rte_eth_dev_rss_reta_update(self.id, reta)
-  if (ret ~= 0) then
-    log:fatal("Error setting up RETA table: " .. errors.getstr(-ret))
-  end
+--- Setup RSS RETA table.
+function dev:setRssNQueues(n, baseQueue)
+	baseQueue = baseQueue or 0
+	assert(n > 0)
+	if bit.band(n, n - 1) ~= 0 then
+		log:warn("RSS distribution to queues will not be fair as the number of queues (%d) is not a power of two.", n)
+	end
+	local retaSize = ffi.C.get_reta_size(self.id)
+	if retaSize % 64 ~= 0 then
+		log:fatal("NYI: number of RETA entries is not a multiple of 64", retaSize)
+	end
+	local entries = ffi.new("struct rte_eth_rss_reta_entry64[?]", retaSize / 64)
+	local queue = baseQueue
+	for i = 0, retaSize / 64 - 1 do
+		entries[i].mask = 0xFFFFFFFFFFFFFFFFULL
+		for j = 0, 63 do
+			entries[i].reta[j] = queue
+			queue = queue + 1
+			if queue == baseQueue + n then
+				queue = baseQueue
+			end
+		end
+	end
+	local ret = ffi.C.rte_eth_dev_rss_reta_update(self.id, entries, retaSize)
+	if (ret ~= 0) then
+		log:fatal("Error setting up RETA table: " .. errors.getstr(-ret))
+	end
 end
 
 
@@ -412,7 +413,9 @@ local deviceNames = {
 	[mod.PCI_ID_X540]	= "Ethernet Controller 10-Gigabit X540-AT2",
 	[mod.PCI_ID_X710]	= "Intel Corporation Ethernet 10G 2P X710 Adapter",
 	[mod.PCI_ID_XL710]	= "Ethernet Controller LX710 for 40GbE QSFP+",
+	[mod.PCI_ID_XL710Q1]	= "Ethernet Converged Network Adapter XL710-Q1",
 	[mod.PCI_ID_82599_VF]	= "Intel Corporation 82599 Ethernet Controller Virtual Function",
+	[mod.PCI_ID_VIRTIO]	= "Virtio network device"
 }
 
 function dev:getName()
@@ -521,7 +524,7 @@ end
 --- get the number of packets received since the last call to this function
 function dev:getRxStats()
 	local devId = self:getPciId()
-	if devId == mod.PCI_ID_XL710 or devId == mod.PCI_ID_X710 then
+	if devId == mod.PCI_ID_XL710 or devId == mod.PCI_ID_X710 or devId == mod.PCI_ID_XL710Q1 then
 		local uprc, mprc, bprc, gorc
 		-- TODO: is this always correct?
 		-- I guess it fails on VFs :/
@@ -531,8 +534,10 @@ function dev:getRxStats()
 		bprc, lastBprc[self.id] = readCtr32(self.id, GLPRT_BPRCL[port], lastBprc[self.id])
 		gorc, lastGorc[self.id] = readCtr48(self.id, GLPRT_GORCL[port], lastGorc[self.id])
 		return uprc + mprc + bprc, gorc
-	else
+	elseif devId == mod.PCI_ID_82599 or devId == mod.PCI_ID_X540 or devId == mod.PCI_ID_X520 or devId == mod.PCI_ID_X520_T2 then
 		return dpdkc.read_reg32(self.id, GPRC), dpdkc.read_reg32(self.id, GORCL) + dpdkc.read_reg32(self.id, GORCH) * 2^32
+	else
+		return 0, 0
 	end
 end
 
@@ -542,7 +547,7 @@ function dev:getTxStats()
 	local badBytes = tonumber(dpdkc.get_bad_bytes_sent(self.id))
 	-- FIXME: this should really be split up into separate functions/files
 	local devId = self:getPciId()
-	if devId == mod.PCI_ID_XL710 or devId == mod.PCI_ID_X710 then
+	if devId == mod.PCI_ID_XL710 or devId == mod.PCI_ID_X710 or devId == mod.PCI_ID_XL710Q1 then
 		local uptc, mptc, bptc, gotc
 		local port = dpdkc.get_pci_function(self.id)
 		uptc, lastUptc[self.id] = readCtr32(self.id, GLPRT_UPTCL[port], lastUptc[self.id])
@@ -550,9 +555,10 @@ function dev:getTxStats()
 		bptc, lastBptc[self.id] = readCtr32(self.id, GLPRT_BPTCL[port], lastBptc[self.id])
 		gotc, lastGotc[self.id] = readCtr48(self.id, GLPRT_GOTCL[port], lastGotc[self.id])
 		return uptc + mptc + bptc - badPkts, gotc - badBytes
-	else
-		-- TODO: check for ixgbe
+	elseif devId == mod.PCI_ID_82599 or devId == mod.PCI_ID_X540 or devId == mod.PCI_ID_X520 or devId == mod.PCI_ID_X520_T2 then
 		return dpdkc.read_reg32(self.id, GPTC) - badPkts, dpdkc.read_reg32(self.id, GOTCL) + dpdkc.read_reg32(self.id, GOTCH) * 2^32 - badBytes
+	else
+		return 0, 0
 	end
 end
 
@@ -577,7 +583,7 @@ local RTTDQSEL = 0x00004904
 function txQueue:setRate(rate)
 	local id = self.dev:getPciId()
 	local dev = self.dev
-	if id == mod.PCI_ID_X710 or id == mod.PCI_ID_XL710 then
+	if id == mod.PCI_ID_X710 or id == mod.PCI_ID_XL710 or id == mod.PCI_ID_XL710Q1 then
 		-- obviously fails if doing that from multiple threads; but you shouldn't do that anways
 		dev.totalRate = dev.totalRate or 0
 		dev.totalRate = dev.totalRate + rate
@@ -632,6 +638,10 @@ function txQueue:setTxRateRaw(rate, disable)
 end
 
 function txQueue:getTxRate()
+	local id = self.dev:getPciId()
+	if id ~= mod.PCI_ID_82599 and id ~= mod.PCI_ID_X540 and id ~= mod.PCI_ID_X520 and id ~= mod.PCI_ID_X520_T2 then
+		return 0
+	end
 	local link = self.dev:getLinkStatus()
 	self.speed = link.speed > 0 and link.speed or 10000
 	dpdkc.write_reg32(self.id, RTTDQSEL, self.qid)
